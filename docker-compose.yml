@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    image: teleprompter-sync
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/teleprompter.db
+    volumes:
+      - teleprompter-data:/data
+    restart: unless-stopped
+
+volumes:
+  teleprompter-data:
