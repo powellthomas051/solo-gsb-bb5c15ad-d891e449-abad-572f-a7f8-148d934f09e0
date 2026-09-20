@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS rooms (
     clock_version          INTEGER NOT NULL DEFAULT 0,  -- 暂停/恢复每切换一次递增
     paused_at              REAL,                        -- 本次暂停开始的 epoch 秒
     progress_epoch         INTEGER NOT NULL DEFAULT 0,  -- 进度代际：导演跳转/重导台本递增
+    hold_version           INTEGER NOT NULL DEFAULT 0,  -- 止点版本：设置/放行/越点/重导递增
+    last_block             TEXT,                        -- JSON：最近一次被止点阻挡的信息
     created_at             REAL NOT NULL
 );
 
@@ -53,6 +55,20 @@ CREATE TABLE IF NOT EXISTS advancements (
 );
 
 CREATE INDEX IF NOT EXISTS idx_advancements_room ON advancements(room_id, id);
+
+CREATE TABLE IF NOT EXISTS holds (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id     TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    position    INTEGER NOT NULL,  -- 止点所在台词位置（随增量修订按台词身份重排）
+    released    INTEGER NOT NULL DEFAULT 0,  -- 0=未释放（生效中），1=已放行（仅留档）
+    created_at  REAL NOT NULL,
+    released_at REAL
+);
+
+-- 同一房间同一位置至多存在一个未释放止点；已放行止点留档不参与唯一约束
+CREATE UNIQUE INDEX IF NOT EXISTS idx_holds_pending
+    ON holds(room_id, position) WHERE released = 0;
+CREATE INDEX IF NOT EXISTS idx_holds_room ON holds(room_id, released, position);
 """
 
 
@@ -86,6 +102,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     - rooms.revision：台本版本号
     - rooms.paused / clock_version / paused_at：排练暂停/恢复时钟
     - rooms.progress_epoch：进度代际（导演校准公共位置 / 重导台本时递增）
+    - rooms.hold_version / last_block：台词止点版本与最近一次阻挡信息
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(rooms)")}
     if "revision" not in columns:
@@ -107,4 +124,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "progress_epoch" not in columns:
         conn.execute(
             "ALTER TABLE rooms ADD COLUMN progress_epoch INTEGER NOT NULL DEFAULT 0"
+        )
+    if "hold_version" not in columns:
+        conn.execute(
+            "ALTER TABLE rooms ADD COLUMN hold_version INTEGER NOT NULL DEFAULT 0"
+        )
+    if "last_block" not in columns:
+        conn.execute(
+            "ALTER TABLE rooms ADD COLUMN last_block TEXT"
         )

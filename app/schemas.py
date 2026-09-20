@@ -97,7 +97,8 @@ class CursorUpdate(BaseModel):
 
     允许前跳或回退；校验代际与目标范围后原子更新公共位置、递增
     ``progress_epoch`` 并清空全部参与者进度，使旧代际的迟到/重试上报失效。
-    目标位置与当前一致时为幂等空操作，代际不递增。
+    目标位置与当前一致时为幂等空操作，代际不递增。校准不受止点限制，
+    前跳越过的未释放止点自动释放并递增 ``hold_version``。
     """
 
     expected_progress_epoch: int = Field(
@@ -106,3 +107,51 @@ class CursorUpdate(BaseModel):
     position: int = Field(
         ge=0, description="导演要校准到的目标台词位置（从 0 开始）"
     )
+
+
+class HoldsSet(BaseModel):
+    """导演批量设置未释放止点：携带止点版本做乐观并发控制。
+
+    ``positions`` 中的位置必须全部属于当前台本（``[0, 台词总数)``）。设置是
+    追加语义：位置上尚无未释放止点的新增为未释放止点，已存在的保持不变；
+    只要有新增，``hold_version`` 原子递增。空列表为幂等空操作。
+    """
+
+    expected_hold_version: int = Field(
+        ge=0, description="客户端已知的 hold_version；与当前不一致时返回 409"
+    )
+    positions: List[int] = Field(
+        description="要设置止点的台词位置（从 0 开始）；重复位置按一个处理"
+    )
+
+    @field_validator("positions")
+    @classmethod
+    def _non_negative(cls, value: List[int]) -> List[int]:
+        if any(position < 0 for position in value):
+            raise ValueError("止点位置不能为负数")
+        return value
+
+
+class HoldsRelease(BaseModel):
+    """导演放行止点：携带止点版本做乐观并发控制，批量释放指定位置。
+
+    原子递增 ``hold_version`` 后立即用当前活跃参与者重算：满足推进条件时
+    可在同一响应中继续推进（仍不得越过最靠前的其余未释放止点）。指定位置
+    必须全部是当前的未释放止点，任一不是则整批 422、状态不变。
+    """
+
+    expected_hold_version: int = Field(
+        ge=0, description="客户端已知的 hold_version；与当前不一致时返回 409"
+    )
+    positions: List[int] = Field(
+        min_length=1, description="要放行的止点位置；每个都必须是当前未释放止点"
+    )
+
+    @field_validator("positions")
+    @classmethod
+    def _non_negative_and_unique(cls, value: List[int]) -> List[int]:
+        if any(position < 0 for position in value):
+            raise ValueError("止点位置不能为负数")
+        if len(set(value)) != len(value):
+            raise ValueError("放行位置存在重复")
+        return value

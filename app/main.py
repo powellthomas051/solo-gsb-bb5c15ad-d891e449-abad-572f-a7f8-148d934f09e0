@@ -22,6 +22,15 @@ progress_epoch 并清空全部参与者进度；旧代际的迟到或重试上�
 不能再推进房间。目标位置与当前一致时为幂等空操作，代际不递增。演员
 上报必须携带当前 progress_epoch（/state 可查）。台本整体导入同样开启
 新代际，使重导前在途的旧上报全部失效。
+
+导演可批量设置台词止点（PUT /rooms/{room_id}/holds，独立的 hold_version
+乐观锁）：止点位置必须属于当前台本；演员上报仍按现有 quorum 计算候选
+位置，但自动推进不得越过最靠前的未释放止点，到达止点后保留参与者最新
+位置（被阻挡时记录最近一次阻挡信息）。放行止点（POST
+/rooms/{room_id}/holds/release）原子递增 hold_version 并立即用当前活跃
+参与者重算，满足条件可在同一响应中继续推进。增量修订后止点按原台词
+身份重排，被删台词上的止点移除；整体导入清空全部止点。手动校准不受
+止点限制，前跳越过的未释放止点自动释放。
 """
 
 from __future__ import annotations
@@ -39,6 +48,8 @@ from .schemas import (
     ClockUpdate,
     CursorUpdate,
     EventReport,
+    HoldsRelease,
+    HoldsSet,
     LinesImport,
     LinesPatch,
     RoomCreate,
@@ -58,7 +69,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="排练提词同步 API",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -99,11 +110,42 @@ def _active_participants(conn, room_id: str, ref_now: float, timeout_seconds: in
     ).fetchall()
 
 
+def _pending_holds(conn, room_id: str) -> List[int]:
+    """当前未释放（生效中）的止点位置，按位置升序。"""
+    return [
+        row["position"]
+        for row in conn.execute(
+            """
+            SELECT position FROM holds
+            WHERE room_id = ? AND released = 0 ORDER BY position
+            """,
+            (room_id,),
+        ).fetchall()
+    ]
+
+
+def _foremost_pending_hold(conn, room_id: str, at_or_after: int) -> Optional[int]:
+    """位置不小于 ``at_or_after`` 的最靠前未释放止点；不存在返回 None。"""
+    row = conn.execute(
+        """
+        SELECT position FROM holds
+        WHERE room_id = ? AND released = 0 AND position >= ?
+        ORDER BY position LIMIT 1
+        """,
+        (room_id, at_or_after),
+    ).fetchone()
+    return None if row is None else row["position"]
+
+
 def _maybe_advance(conn, room, now: float) -> Optional[Dict[str, Any]]:
     """按活跃参与者重算公共位置；仅在提升时落库并返回推进记录。
 
     活跃参与者中第 ``advance_threshold`` 高的位置，即为“达到指定人数的
     最高台词”。公共位置只在算出的候选值更高时才更新，因此绝不回退。
+
+    自动推进不得越过最靠前的未释放止点（位置不小于当前公共位置）：候选
+    位置超过该止点时公共位置最多推进到止点本身，并把阻挡信息写入房间的
+    ``last_block``；参与者上报的最新位置原样保留，待止点放行后再次重算。
     """
     threshold = room["advance_threshold"]
     ref_now = _reference_now(room, now)
@@ -114,23 +156,74 @@ def _maybe_advance(conn, room, now: float) -> Optional[Dict[str, Any]]:
     candidate = positions[threshold - 1]
     if candidate <= room["public_position"]:
         return None
-    contributors = sorted(row["participant_id"] for row in rows if row["position"] >= candidate)
+
+    blocking = _foremost_pending_hold(conn, room["id"], room["public_position"])
+    if blocking is not None and candidate > blocking:
+        # 到达/停留在止点：公共位置最多推进到止点本身；参与者位置原样保留，
+        # 待止点放行后再次重算。
+        past = sorted(row["participant_id"] for row in rows if row["position"] > blocking)
+        block_reason = (
+            f"自动推进被止点 {blocking} 阻挡：quorum 候选位置为 {candidate}"
+            f"（要求 {threshold} 人），最新位置越过止点的参与者："
+            f"{', '.join(past) if past else '无'}"
+        )
+        last_block = {
+            "hold_position": blocking,
+            "candidate_position": candidate,
+            "reason": block_reason,
+            "participants_past_hold": past,
+            "at": now,
+        }
+        if blocking <= room["public_position"]:
+            # 已停在止点（如导演校准到该位置）后又有越过它的上报：位置不动，
+            # 仅刷新最近一次阻挡信息，不重复写推进记录。
+            conn.execute(
+                "UPDATE rooms SET last_block = ? WHERE id = ?",
+                (json.dumps(last_block, ensure_ascii=False), room["id"]),
+            )
+            return None
+        reason = (
+            f"{threshold} 名活跃参与者的 quorum 候选位置 {candidate} 越过止点 "
+            f"{blocking}，公共位置在止点前等待放行"
+        )
+        conn.execute(
+            "UPDATE rooms SET public_position = ?, last_block = ? WHERE id = ?",
+            (blocking, json.dumps(last_block, ensure_ascii=False), room["id"]),
+        )
+        conn.execute(
+            """
+            INSERT INTO advancements (room_id, position, reason, contributors, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (room["id"], blocking, reason, json.dumps([], ensure_ascii=False), now),
+        )
+        return {
+            "position": blocking,
+            "reason": reason,
+            "contributors": [],
+            "at": now,
+            "blocked": True,
+            "block": last_block,
+        }
+
+    target = candidate
+    contributors = sorted(row["participant_id"] for row in rows if row["position"] >= target)
     reason = (
-        f"{len(contributors)} 名活跃参与者已到达台词 {candidate}"
+        f"{len(contributors)} 名活跃参与者已到达台词 {target}"
         f"（要求 {threshold} 人）：{', '.join(contributors)}"
     )
     conn.execute(
-        "UPDATE rooms SET public_position = ? WHERE id = ?",
-        (candidate, room["id"]),
+        "UPDATE rooms SET public_position = ?, last_block = NULL WHERE id = ?",
+        (target, room["id"]),
     )
     conn.execute(
         """
         INSERT INTO advancements (room_id, position, reason, contributors, created_at)
         VALUES (?, ?, ?, ?, ?)
         """,
-        (room["id"], candidate, reason, json.dumps(contributors, ensure_ascii=False), now),
+        (room["id"], target, reason, json.dumps(contributors, ensure_ascii=False), now),
     )
-    return {"position": candidate, "reason": reason, "contributors": contributors, "at": now}
+    return {"position": target, "reason": reason, "contributors": contributors, "at": now}
 
 
 def _room_payload(room) -> Dict[str, Any]:
@@ -142,6 +235,7 @@ def _room_payload(room) -> Dict[str, Any]:
         "public_position": room["public_position"],
         "revision": room["revision"],
         "progress_epoch": room["progress_epoch"],
+        "hold_version": room["hold_version"],
         "created_at": room["created_at"],
     }
 
@@ -191,6 +285,9 @@ def _state_payload(conn, room, now: float) -> Dict[str, Any]:
         "SELECT COUNT(*) AS c FROM lines WHERE room_id = ?", (room_id,)
     ).fetchone()["c"]
 
+    pending_holds = _pending_holds(conn, room_id)
+    last_block = json.loads(room["last_block"]) if room["last_block"] else None
+
     return {
         "room_id": room_id,
         "name": room["name"],
@@ -199,6 +296,9 @@ def _state_payload(conn, room, now: float) -> Dict[str, Any]:
         "lines_count": lines_count,
         "revision": room["revision"],
         "progress_epoch": room["progress_epoch"],
+        "hold_version": room["hold_version"],
+        "pending_holds": pending_holds,
+        "last_block": last_block,
         "public_position": public_position,
         "current_line": current_line,
         "active_participants": participants,
@@ -269,6 +369,8 @@ def import_lines(room_id: str, payload: LinesImport) -> Dict[str, Any]:
     台本变化后旧的位置上报不再有意义，因此导入会重置公共位置、
     参与者与推进历史；每次导入版本号（revision）递增，同时进度代际
     （progress_epoch）递增，使重导前在途的旧代际上报全部失效（返回 409）。
+    整体导入同时清空全部止点（含留档）、递增止点版本（hold_version）
+    并清除最近一次阻挡信息，使重导前在途的止点设置/放行请求失效。
     """
     conn = connect()
     try:
@@ -281,23 +383,33 @@ def import_lines(room_id: str, payload: LinesImport) -> Dict[str, Any]:
         )
         new_revision = room["revision"] + 1
         new_progress_epoch = room["progress_epoch"] + 1
+        # 首次导入只是初始上本（与 revision/progress_epoch 从 1 起计同理），
+        # 不存在止点，无需递增止点版本；之后整体重导清空全部止点并递增。
+        existing_holds = conn.execute(
+            "SELECT COUNT(*) AS c FROM holds WHERE room_id = ?", (room_id,)
+        ).fetchone()["c"]
+        new_hold_version = room["hold_version"] + (1 if existing_holds else 0)
         conn.execute(
             """
             UPDATE rooms
-            SET public_position = -1, revision = ?, progress_epoch = ?
+            SET public_position = -1, revision = ?, progress_epoch = ?,
+                hold_version = ?, last_block = NULL
             WHERE id = ?
             """,
-            (new_revision, new_progress_epoch, room_id),
+            (new_revision, new_progress_epoch, new_hold_version, room_id),
         )
         conn.execute("DELETE FROM participants WHERE room_id = ?", (room_id,))
         conn.execute("DELETE FROM advancements WHERE room_id = ?", (room_id,))
+        conn.execute("DELETE FROM holds WHERE room_id = ?", (room_id,))
         conn.commit()
         return {
             "room_id": room_id,
             "lines_imported": len(payload.lines),
             "progress_reset": True,
+            "holds_cleared": True,
             "revision": new_revision,
             "progress_epoch": new_progress_epoch,
+            "hold_version": new_hold_version,
         }
     except Exception:
         conn.rollback()
@@ -333,7 +445,8 @@ def patch_lines(room_id: str, payload: LinesPatch) -> Dict[str, Any]:
     与当前版本不一致返回 409；任一操作越界或与同一行的其他操作冲突，
     整批不落库。修订成功后版本递增，参与者与公共位置按原先指向的台词
     身份重排：保留的台词跟随新位置，被删除的回退到最近仍保留的前一行，
-    无前一行则置为 -1。修订本身不写入推进记录。
+    无前一行则置为 -1。未释放止点同样按原台词身份重排：保留的台词跟随
+    新位置，被删台词上的止点移除。修订本身不写入推进记录。
     """
     conn = connect()
     try:
@@ -431,6 +544,26 @@ def patch_lines(room_id: str, payload: LinesPatch) -> Dict[str, Any]:
                 remapped += 1
         new_public_position = remap(room["public_position"])
 
+        # ---- 止点按原台词身份重排：保留（含替换）的台词跟随新位置，
+        #      被删台词上的未释放止点直接移除 ----
+        holds = conn.execute(
+            "SELECT id, position FROM holds WHERE room_id = ? AND released = 0",
+            (room_id,),
+        ).fetchall()
+        holds_remapped = 0
+        holds_removed = 0
+        for hold in holds:
+            new_position = kept.get(hold["position"])
+            if new_position is None:
+                conn.execute("DELETE FROM holds WHERE id = ?", (hold["id"],))
+                holds_removed += 1
+            elif new_position != hold["position"]:
+                conn.execute(
+                    "UPDATE holds SET position = ? WHERE id = ?",
+                    (new_position, hold["id"]),
+                )
+                holds_remapped += 1
+
         # ---- 落库新台本并递增版本 ----
         conn.execute("DELETE FROM lines WHERE room_id = ?", (room_id,))
         conn.executemany(
@@ -438,8 +571,9 @@ def patch_lines(room_id: str, payload: LinesPatch) -> Dict[str, Any]:
             [(room_id, position, text) for position, text in enumerate(new_texts)],
         )
         new_revision = room["revision"] + 1
+        # 阻挡信息引用的止点行号可能已随修订失效，一并清除
         conn.execute(
-            "UPDATE rooms SET public_position = ?, revision = ? WHERE id = ?",
+            "UPDATE rooms SET public_position = ?, revision = ?, last_block = NULL WHERE id = ?",
             (new_public_position, new_revision, room_id),
         )
         conn.commit()
@@ -449,6 +583,8 @@ def patch_lines(room_id: str, payload: LinesPatch) -> Dict[str, Any]:
             "lines_count": len(new_texts),
             "public_position": new_public_position,
             "participants_remapped": remapped,
+            "holds_remapped": holds_remapped,
+            "holds_removed": holds_removed,
         }
     except Exception:
         conn.rollback()
@@ -641,6 +777,10 @@ def update_cursor(room_id: str, payload: CursorUpdate) -> Dict[str, Any]:
     3. 清空全部参与者进度，使公共位置从干净状态重新由上报汇聚；
     4. 写入一条推进记录，标明本次位置变化由导演校准触发。
 
+    校准不受止点限制：前跳时越过（位置严格小于目标）的未释放止点
+    原子自动释放并递增 ``hold_version``；目标位置上的止点保留，仍可阻挡
+    之后越过它的自动推进。回退不释放任何止点。阻挡信息在校准后清除。
+
     校准不受暂停状态影响：暂停期间导演仍可调整公共位置；时钟状态
     （paused / clock_version）不随校准改变。
     """
@@ -653,6 +793,8 @@ def update_cursor(room_id: str, payload: CursorUpdate) -> Dict[str, Any]:
                 "changed": False,
                 "public_position": room["public_position"],
                 "progress_epoch": room["progress_epoch"],
+                "hold_version": room["hold_version"],
+                "released_holds": [],
                 "state": _state_payload(conn, room, _now()),
             }
 
@@ -667,6 +809,8 @@ def update_cursor(room_id: str, payload: CursorUpdate) -> Dict[str, Any]:
                     "changed": False,
                     "public_position": fresh["public_position"],
                     "progress_epoch": fresh["progress_epoch"],
+                    "hold_version": fresh["hold_version"],
+                    "released_holds": [],
                     "state": _state_payload(conn, fresh, now),
                 }
             if payload.expected_progress_epoch != room["progress_epoch"]:
@@ -693,14 +837,41 @@ def update_cursor(room_id: str, payload: CursorUpdate) -> Dict[str, Any]:
                 )
 
             new_epoch = room["progress_epoch"] + 1
+            new_hold_version = room["hold_version"]
+            released_holds: List[int] = []
+            if payload.position > room["public_position"]:
+                # 前跳越过（严格小于目标）的未释放止点自动释放
+                crossed = conn.execute(
+                    """
+                    SELECT position FROM holds
+                    WHERE room_id = ? AND released = 0 AND position < ?
+                    ORDER BY position
+                    """,
+                    (room_id, payload.position),
+                ).fetchall()
+                released_holds = [row["position"] for row in crossed]
+                if released_holds:
+                    conn.execute(
+                        """
+                        UPDATE holds SET released = 1, released_at = ?
+                        WHERE room_id = ? AND released = 0 AND position < ?
+                        """,
+                        (now, room_id, payload.position),
+                    )
+                    new_hold_version += 1
             direction = "前跳" if payload.position > room["public_position"] else "回退"
             reason = (
                 f"导演校准公共位置：{direction} {room['public_position']} → "
                 f"{payload.position}（progress_epoch {room['progress_epoch']} → {new_epoch}）"
             )
             conn.execute(
-                "UPDATE rooms SET public_position = ?, progress_epoch = ? WHERE id = ?",
-                (payload.position, new_epoch, room_id),
+                """
+                UPDATE rooms
+                SET public_position = ?, progress_epoch = ?, hold_version = ?,
+                    last_block = NULL
+                WHERE id = ?
+                """,
+                (payload.position, new_epoch, new_hold_version, room_id),
             )
             # 清空参与者进度：新代际从干净状态重新汇聚，旧代际上报一律失效
             conn.execute("DELETE FROM participants WHERE room_id = ?", (room_id,))
@@ -721,8 +892,150 @@ def update_cursor(room_id: str, payload: CursorUpdate) -> Dict[str, Any]:
             "changed": True,
             "public_position": fresh["public_position"],
             "progress_epoch": fresh["progress_epoch"],
+            "hold_version": fresh["hold_version"],
+            "released_holds": released_holds,
             "state": _state_payload(conn, fresh, _now()),
         }
+    finally:
+        conn.close()
+
+
+@app.put("/rooms/{room_id}/holds")
+def set_holds(room_id: str, payload: HoldsSet) -> Dict[str, Any]:
+    """导演批量设置未释放止点（追加语义）。
+
+    携带客户端已知的 ``hold_version`` 做乐观锁：与当前版本不一致返回
+    409，状态不变。``positions`` 必须全部属于当前台本（在
+    ``[0, 台词总数)`` 内），任一越界返回 422、整批不落库；房间尚未导入
+    台词返回 409。位置上已存在未释放止点的保持不变，其余新增为未释放
+    止点；只要有新增，``hold_version`` 原子递增（重复设置同一批为止幂等
+    空操作，版本不递增）。设置止点本身不触发推进重算。
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        room = _get_room(conn, room_id)
+        if payload.expected_hold_version != room["hold_version"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"止点版本不匹配: expected_hold_version="
+                    f"{payload.expected_hold_version}, 当前 hold_version="
+                    f"{room['hold_version']}"
+                ),
+            )
+        lines_count = conn.execute(
+            "SELECT COUNT(*) AS c FROM lines WHERE room_id = ?", (room_id,)
+        ).fetchone()["c"]
+        if lines_count == 0:
+            raise HTTPException(status_code=409, detail="房间尚未导入台词")
+        wanted = sorted(set(payload.positions))
+        for position in wanted:
+            if position >= lines_count:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"止点位置越界: position={position}, 台词总数={lines_count}"
+                    ),
+                )
+
+        existing = set(_pending_holds(conn, room_id))
+        added = [position for position in wanted if position not in existing]
+        if added:
+            now = _now()
+            conn.executemany(
+                """
+                INSERT INTO holds (room_id, position, released, created_at)
+                VALUES (?, ?, 0, ?)
+                """,
+                [(room_id, position, now) for position in added],
+            )
+            new_hold_version = room["hold_version"] + 1
+            conn.execute(
+                "UPDATE rooms SET hold_version = ? WHERE id = ?",
+                (new_hold_version, room_id),
+            )
+        else:
+            new_hold_version = room["hold_version"]
+        conn.commit()
+
+        fresh = _get_room(conn, room_id)
+        return {
+            "changed": bool(added),
+            "hold_version": fresh["hold_version"],
+            "added": added,
+            "pending_holds": _pending_holds(conn, room_id),
+            "state": _state_payload(conn, fresh, _now()),
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@app.post("/rooms/{room_id}/holds/release")
+def release_holds(room_id: str, payload: HoldsRelease) -> Dict[str, Any]:
+    """导演放行止点：原子递增版本后立即重算，可在同一响应中继续推进。
+
+    携带客户端已知的 ``hold_version`` 做乐观锁：不一致返回 409、状态不变。
+    ``positions`` 中的每个位置都必须是当前未释放止点，任一不是（不存在、
+    已放行）返回 422、整批不落库。校验通过后在同一事务中：把指定止点
+    标记为已放行并记录放行时间，``hold_version`` 原子递增，随后立即用
+    当前活跃参与者重算公共位置——满足 quorum 时自动推进，仍不得越过最靠
+    前的其余未释放止点（可能停在下一个止点并更新阻挡信息）。
+    """
+    now = _now()
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        room = _get_room(conn, room_id)
+        if payload.expected_hold_version != room["hold_version"]:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"止点版本不匹配: expected_hold_version="
+                    f"{payload.expected_hold_version}, 当前 hold_version="
+                    f"{room['hold_version']}"
+                ),
+            )
+        wanted = sorted(set(payload.positions))
+        current = set(_pending_holds(conn, room_id))
+        unknown = [position for position in wanted if position not in current]
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail=f"以下位置不是当前未释放止点: {unknown}",
+            )
+
+        conn.execute(
+            """
+            UPDATE holds SET released = 1, released_at = ?
+            WHERE room_id = ? AND released = 0 AND position IN (%s)
+            """ % ",".join("?" for _ in wanted),
+            (now, room_id, *wanted),
+        )
+        new_hold_version = room["hold_version"] + 1
+        conn.execute(
+            "UPDATE rooms SET hold_version = ? WHERE id = ?",
+            (new_hold_version, room_id),
+        )
+        # 放行后立即用当前活跃参与者重算；room 的公共位置可能已被推进更新
+        fresh_room = _get_room(conn, room_id)
+        advancement = _maybe_advance(conn, fresh_room, now)
+        conn.commit()
+
+        final_room = _get_room(conn, room_id)
+        return {
+            "released": wanted,
+            "hold_version": final_room["hold_version"],
+            "advancement": advancement,
+            "pending_holds": _pending_holds(conn, room_id),
+            "state": _state_payload(conn, final_room, now),
+        }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
