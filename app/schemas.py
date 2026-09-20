@@ -106,3 +106,49 @@ class CursorUpdate(BaseModel):
     position: int = Field(
         ge=0, description="导演要校准到的目标台词位置（从 0 开始）"
     )
+
+
+class HoldsSet(BaseModel):
+    """导演批量设置未放行止点：整组替换当前止点集合。
+
+    ``positions`` 为要保留的全部止点行号（须属于当前台本），重复行号会被
+    去重；传空列表即清空全部止点。``expected_hold_version`` 与当前止点版本
+    不一致返回 409；目标集合与当前完全一致时为幂等空操作，版本不递增。
+    """
+
+    expected_hold_version: int = Field(
+        ge=0, description="客户端已知的 hold_version；与当前不一致时返回 409"
+    )
+    positions: List[int] = Field(
+        description="未放行止点所在台本行号（从 0 开始）；整组替换当前止点"
+    )
+
+    @field_validator("positions")
+    @classmethod
+    def _check_nonnegative_and_dedupe(cls, value: List[int]) -> List[int]:
+        if any(position < 0 for position in value):
+            raise ValueError("止点行号不能为负数")
+        return sorted(set(value))
+
+
+class HoldsRelease(BaseModel):
+    """导演放行止点：原子递增止点版本并立即按当前活跃参与者重算推进。
+
+    重算满足 quorum 时可在同一响应中继续推进（并可继续越过后续已放行位置，
+    但仍不得越过其余未放行止点）。放行不存在的止点返回 422；
+    ``expected_hold_version`` 与当前不一致返回 409。
+    """
+
+    expected_hold_version: int = Field(
+        ge=0, description="客户端已知的 hold_version；与当前不一致时返回 409"
+    )
+    positions: List[int] = Field(
+        min_length=1, description="要放行的止点行号；至少一个"
+    )
+
+    @field_validator("positions")
+    @classmethod
+    def _check_nonnegative_and_dedupe(cls, value: List[int]) -> List[int]:
+        if any(position < 0 for position in value):
+            raise ValueError("止点行号不能为负数")
+        return sorted(set(value))

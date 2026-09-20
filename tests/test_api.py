@@ -979,3 +979,356 @@ def test_duplicate_event_under_current_epoch_still_idempotent(client):
     assert dup.json()["applied"] is False
     assert dup.json()["progress_epoch"] == 1
 
+
+# ---------------------------------------------------------------------------
+# 台词止点（holds）：设置/放行、推进钳制、修订重排、校准自动释放
+# ---------------------------------------------------------------------------
+
+def set_holds(client, room_id, expected_hold_version, positions):
+    return client.put(f"/rooms/{room_id}/holds", json={
+        "expected_hold_version": expected_hold_version,
+        "positions": positions,
+    })
+
+
+def release_holds(client, room_id, expected_hold_version, positions):
+    return client.post(f"/rooms/{room_id}/holds/release", json={
+        "expected_hold_version": expected_hold_version,
+        "positions": positions,
+    })
+
+
+def holds(client, room_id):
+    resp = client.get(f"/rooms/{room_id}/holds")
+    assert resp.status_code == 200, resp.text
+    return resp.json()
+
+
+def hold_positions(client, room_id):
+    return [h["position"] for h in holds(client, room_id)["pending_holds"]]
+
+
+def test_state_hold_fields_start_empty(client):
+    room_id = make_room(client)
+    current = state(client, room_id)
+    assert current["hold_version"] == 0
+    assert current["pending_holds"] == []
+    assert current["last_hold_block"] is None
+    assert client.get(f"/rooms/{room_id}").json()["hold_version"] == 0
+
+
+def test_set_holds_batches_positions_and_bumps_version(client):
+    room_id = make_room(client)
+    resp = set_holds(client, room_id, 0, [3, 1, 3])  # 重复去重、无需有序
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["changed"] is True
+    assert body["hold_version"] == 1
+    assert [h["position"] for h in body["pending_holds"]] == [1, 3]
+    # 止点附带台词文本
+    assert body["pending_holds"][1] == {"position": 3, "text": "乙：谢谢。"}
+    assert holds(client, room_id)["hold_version"] == 1
+    assert hold_positions(client, room_id) == [1, 3]
+    assert state(client, room_id)["hold_version"] == 1
+
+
+def test_set_holds_validates_range_and_state(client):
+    room_id = make_room(client)  # 5 行
+    assert set_holds(client, room_id, 0, [5]).status_code == 422
+    assert set_holds(client, room_id, 0, [-1]).status_code == 422  # 请求体校验
+    # 版本不匹配：409，止点不变
+    resp = set_holds(client, room_id, 99, [1])
+    assert resp.status_code == 409, resp.text
+    assert hold_positions(client, room_id) == []
+    assert state(client, room_id)["hold_version"] == 0
+
+    # 尚未导入台词：409
+    empty_id = "room-" + uuid.uuid4().hex[:8]
+    client.post("/rooms", json={
+        "id": empty_id, "name": "空房间",
+        "advance_threshold": 1, "offline_timeout_seconds": 30,
+    })
+    assert set_holds(client, empty_id, 0, [0]).status_code == 409
+
+
+def test_set_same_holds_is_idempotent_no_version_bump(client):
+    room_id = make_room(client)
+    set_holds(client, room_id, 0, [1, 3])
+    # 相同集合（即使携带过期版本）：幂等空操作，不增版
+    resp = set_holds(client, room_id, 0, [3, 1])
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["changed"] is False
+    assert body["hold_version"] == 1
+    # 清空幂等：初始为空时再传空列表同样不增版
+    other = make_room(client)
+    resp = set_holds(client, other, 99, [])
+    assert resp.json()["changed"] is False
+    assert resp.json()["hold_version"] == 0
+
+
+def test_set_holds_replaces_whole_set_and_can_clear(client):
+    room_id = make_room(client)
+    set_holds(client, room_id, 0, [1, 2, 3])
+    # 整组替换为新集合
+    resp = set_holds(client, room_id, 1, [4])
+    assert resp.json()["changed"] is True
+    assert resp.json()["hold_version"] == 2
+    assert hold_positions(client, room_id) == [4]
+    # 传空列表清空全部止点
+    resp = set_holds(client, room_id, 2, [])
+    assert resp.json()["changed"] is True
+    assert resp.json()["hold_version"] == 3
+    assert hold_positions(client, room_id) == []
+
+
+def test_advance_clamps_at_earliest_hold_but_keeps_participant_positions(client):
+    room_id = make_room(client, threshold=2)
+    set_holds(client, room_id, 0, [2, 4])
+
+    # 两人都上报到 4：quorum 候选为 4，但不得越过最靠前的止点 2
+    resp = report(client, room_id, "actor-a", 1, 4)
+    assert resp.json()["advancement"] is None  # 阈值未达成
+    resp = report(client, room_id, "actor-b", 1, 4)
+    body = resp.json()
+    advancement = body["advancement"]
+    assert advancement["position"] == 2  # 公共位置停在止点
+    block = advancement["hold_block"]
+    assert block["hold_position"] == 2
+    assert block["candidate_position"] == 4
+    assert set(block["contributors"]) == {"actor-a", "actor-b"}
+
+    current = state(client, room_id)
+    assert current["public_position"] == 2
+    # 参与者的最新位置原样保留（未被钳制）
+    positions = {p["participant_id"]: p["position"]
+                 for p in current["active_participants"]}
+    assert positions == {"actor-a": 4, "actor-b": 4}
+    # /state 暴露最近一次阻挡信息
+    assert current["last_hold_block"]["hold_position"] == 2
+    assert current["last_hold_block"]["candidate_position"] == 4
+
+    # 更多上报不会越过止点，也不会重复写推进记录；阻挡信息持续刷新
+    resp = report(client, room_id, "actor-a", 2, 4)
+    assert resp.json()["advancement"] is None
+    assert state(client, room_id)["public_position"] == 2
+    history = client.get(f"/rooms/{room_id}/advancements").json()["advancements"]
+    assert [a["position"] for a in history] == [2]
+
+
+def test_advancing_exactly_onto_hold_is_not_blocked(client):
+    room_id = make_room(client, threshold=1)
+    set_holds(client, room_id, 0, [3])
+    # 候选恰好等于止点：正常推进，不算阻挡
+    resp = report(client, room_id, "actor-a", 1, 3)
+    advancement = resp.json()["advancement"]
+    assert advancement["position"] == 3
+    assert "hold_block" not in advancement
+    assert state(client, room_id)["public_position"] == 3
+    assert state(client, room_id)["last_hold_block"] is None
+    # 再往前即被挡住
+    resp = report(client, room_id, "actor-a", 2, 4)
+    assert resp.json()["advancement"] is None
+    assert state(client, room_id)["public_position"] == 3
+    assert state(client, room_id)["last_hold_block"]["hold_position"] == 3
+
+
+def test_holds_behind_public_position_are_inert(client):
+    room_id = make_room(client, threshold=1)
+    report(client, room_id, "actor-a", 1, 4)
+    assert state(client, room_id)["public_position"] == 4
+    # 在已越过的位置上设置止点：合法但不会阻挡（也不会使公共位置回退）
+    set_holds(client, room_id, 0, [1, 2])
+    resp = report(client, room_id, "actor-a", 2, 4)
+    assert resp.json()["advancement"] is None
+    assert state(client, room_id)["public_position"] == 4
+    assert state(client, room_id)["last_hold_block"] is None
+
+
+def test_release_hold_atomically_bumps_and_advances_in_same_response(client):
+    room_id = make_room(client, threshold=2)
+    set_holds(client, room_id, 0, [2, 4])
+    report(client, room_id, "actor-a", 1, 4)
+    report(client, room_id, "actor-b", 1, 4)
+    assert state(client, room_id)["public_position"] == 2
+
+    # 版本不匹配：409，止点与公共位置均不变
+    resp = release_holds(client, room_id, 0, [2])
+    assert resp.status_code == 409, resp.text
+    assert state(client, room_id)["public_position"] == 2
+    assert hold_positions(client, room_id) == [2, 4]
+
+    # 放行 2：原子增版本，并立即用当前活跃参与者重算 → 停在下一道止点 4
+    resp = release_holds(client, room_id, 1, [2])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["released"] == [2]
+    assert body["hold_version"] == 2
+    assert [h["position"] for h in body["pending_holds"]] == [4]
+    # 同一响应内继续推进到 4（候选 4 恰好落在止点，正常推进）
+    assert body["advancement"]["position"] == 4
+    assert "hold_block" not in body["advancement"]
+    assert state(client, room_id)["public_position"] == 4
+    history = client.get(f"/rooms/{room_id}/advancements").json()["advancements"]
+    assert [a["position"] for a in history] == [2, 4]
+    assert "放行止点" in history[1]["reason"]
+
+    # 放行最后一道止点：无进一步候选（参与者已在 4），版本仍递增
+    resp = release_holds(client, room_id, 2, [4])
+    assert resp.json()["hold_version"] == 3
+    assert resp.json()["advancement"] is None
+    assert hold_positions(client, room_id) == []
+
+
+def test_release_can_advance_past_multiple_released_holds(client):
+    room_id = make_room(client, threshold=1)
+    set_holds(client, room_id, 0, [1, 2, 4])
+    report(client, room_id, "actor-a", 1, 3)
+    assert state(client, room_id)["public_position"] == 1
+    # 一次放行 1、2：重算后越过已放行位置，停在仍未放行的 4 之前——候选为
+    # 3，直接推进到 3
+    resp = release_holds(client, room_id, 1, [2, 1])
+    body = resp.json()
+    assert body["released"] == [1, 2]
+    assert body["advancement"]["position"] == 3
+    assert hold_positions(client, room_id) == [4]
+    assert state(client, room_id)["public_position"] == 3
+
+
+def test_release_unknown_hold_returns_422(client):
+    room_id = make_room(client)
+    set_holds(client, room_id, 0, [2])
+    # 不存在的止点：422，全部不放行
+    resp = release_holds(client, room_id, 1, [2, 3])
+    assert resp.status_code == 422, resp.text
+    assert hold_positions(client, room_id) == [2]
+    assert state(client, room_id)["hold_version"] == 1
+    # 空列表请求体校验失败
+    assert client.post(f"/rooms/{room_id}/holds/release", json={
+        "expected_hold_version": 1, "positions": [],
+    }).status_code == 422
+
+
+def test_patch_remaps_holds_by_line_identity_and_removes_on_delete(client):
+    room_id = make_room(client)  # 0..4
+    set_holds(client, room_id, 0, [0, 3])
+
+    # 行首插入：止点按原台词身份跟随到新位置
+    resp = patch_lines(client, room_id, 1, [
+        {"op": "insert", "position": 0, "text": "导演：开机。"},
+    ])
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["holds_removed"] == 0
+    assert body["pending_holds"] == [1, 4]
+    assert body["hold_version"] == 2
+    assert hold_positions(client, room_id) == [1, 4]
+
+    # 删除止点所在台词（现位于行 4）：该止点按规则移除（不回退）；行 1 保留
+    resp = patch_lines(client, room_id, 2, [{"op": "delete", "position": 4}])
+    assert resp.json()["holds_removed"] == 1
+    assert resp.json()["pending_holds"] == [1]
+    assert resp.json()["hold_version"] == 3
+    assert hold_positions(client, room_id) == [1]
+
+
+def test_patch_without_hold_change_does_not_bump_hold_version(client):
+    room_id = make_room(client)
+    set_holds(client, room_id, 0, [2])
+    # replace 只改文本：止点原地不动，hold_version 不递增
+    resp = patch_lines(client, room_id, 1, [
+        {"op": "replace", "position": 2, "text": "甲：请坐吧。"},
+    ])
+    assert resp.json()["hold_version"] == 1
+    assert resp.json()["pending_holds"] == [2]
+    # 从未设置过止点的房间：修订也不产生止点版本
+    other = make_room(client)
+    resp = patch_lines(client, other, 1, [
+        {"op": "insert", "position": 0, "text": "导演：开机。"},
+    ])
+    assert resp.json()["hold_version"] == 0
+    assert resp.json()["pending_holds"] == []
+
+
+def test_import_lines_clears_holds(client):
+    room_id = make_room(client, threshold=1)
+    set_holds(client, room_id, 0, [2])
+    report(client, room_id, "actor-a", 1, 4)  # 越过止点：停在 2 并记录阻挡
+    assert state(client, room_id)["public_position"] == 2
+    assert state(client, room_id)["last_hold_block"] is not None
+
+    resp = client.post(f"/rooms/{room_id}/lines", json={"lines": ["新台词一", "新台词二"]})
+    assert resp.status_code == 200
+    current = state(client, room_id)
+    assert hold_positions(client, room_id) == []
+    assert current["pending_holds"] == []
+    assert current["last_hold_block"] is None
+    assert current["hold_version"] == 2  # 0 → 设置 → 1，导入清空 → 2
+
+    # 从未有过止点的房间整体导入：hold_version 保持 0
+    other = make_room(client)
+    client.post(f"/rooms/{other}/lines", json={"lines": ["a", "b"]})
+    assert state(client, other)["hold_version"] == 0
+
+
+def test_cursor_crossing_holds_auto_releases_but_keeps_hold_at_target(client):
+    room_id = make_room(client, threshold=1)
+    set_holds(client, room_id, 0, [1, 2, 4])
+
+    # 导演前跳到 3：严格越过的止点 1、2 自动释放；目标处无止点
+    resp = put_cursor(client, room_id, 1, 3)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["hold_version"] == 2
+    assert hold_positions(client, room_id) == [4]
+    assert state(client, room_id)["public_position"] == 3
+
+    # 新代际上报：止点 4 仍然生效
+    report(client, room_id, "actor-a", 1, 4, progress_epoch=2)
+    assert state(client, room_id)["public_position"] == 4
+
+    # 校准恰好落到止点上：该止点保留，仍可阻挡后续推进
+    other = make_room(client, threshold=1)
+    set_holds(client, other, 0, [2, 4])
+    put_cursor(client, other, 1, 2)
+    assert hold_positions(client, other) == [2, 4]
+    report(client, other, "actor-a", 1, 4, progress_epoch=2)
+    assert state(client, other)["public_position"] == 2  # 止点 2 未被释放
+
+    # 继续校准越过 2：2 被释放，hold_version 1 → 2，前方仅剩止点 4
+    resp = put_cursor(client, other, 2, 3)
+    assert resp.json()["hold_version"] == 2
+    assert hold_positions(client, other) == [4]
+
+
+def test_cursor_without_crossing_hold_does_not_bump_hold_version(client):
+    room_id = make_room(client, threshold=1)
+    set_holds(client, room_id, 0, [4])
+    # 回退校准到 2：不越过任何止点，hold_version 不变
+    report(client, room_id, "actor-a", 1, 4)  # 先推进到 4
+    put_cursor(client, room_id, 1, 2)
+    assert state(client, room_id)["hold_version"] == 1
+    assert hold_positions(client, room_id) == [4]
+
+
+def test_holds_work_while_paused_and_release_uses_frozen_active_set(client):
+    room_id = make_room(client, threshold=1, timeout=10)
+    set_holds(client, room_id, 0, [2])
+    report(client, room_id, "actor-a", 1, 4)
+    assert state(client, room_id)["public_position"] == 2
+    pause(client, room_id)
+    client.clock.advance(1000)  # 暂停期间不会离线
+
+    # 暂停期间导演仍可放行；活跃集合冻结，重算立即推进到 4
+    resp = release_holds(client, room_id, 1, [2])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["advancement"]["position"] == 4
+    assert state(client, room_id)["public_position"] == 4
+    # 设置止点在暂停期间同样可用
+    assert set_holds(client, room_id, 2, [4]).status_code == 200
+
+
+def test_holds_unknown_room_returns_404(client):
+    assert client.get("/rooms/nope/holds").status_code == 404
+    assert set_holds(client, "nope", 0, [0]).status_code == 404
+    assert release_holds(client, "nope", 0, [0]).status_code == 404
+

@@ -9,6 +9,10 @@
 409。支持 **排练暂停/恢复**（冻结超时判定、暂停期间拒绝上报，恢复时扣除整段
 暂停时长）。台本支持 **带版本号的增量修订**：按当前行号执行
 insert/replace/delete，整批原子生效，参与者与公共位置按台词身份自动重排。
+导演还可批量设置**台词止点**（携带 `hold_version` 乐观锁）：演员 quorum
+推进不得越过最靠前的未放行止点（参与者最新位置保留），放行时原子递增版本
+并立即重算、可在同一响应中继续推进；修订后止点按台词身份重排、删线移除，
+整体导入清空，手动校准不受止点限制并自动释放越过的止点。
 
 ## 快速启动（单条命令）
 
@@ -86,6 +90,20 @@ curl -X PUT http://localhost:8000/rooms/demo/cursor \
   -d '{"expected_progress_epoch":1,"position":0}'
 # → {"changed":true,"public_position":0,"progress_epoch":2,"state":{...}}
 # 此后演员必须携带 progress_epoch=2 上报；携带旧代际 1 的迟到/重试事件返回 409
+
+# 9. 导演批量设置台词止点：携带当前 hold_version，止点行号必须属于当前台本
+curl -X PUT http://localhost:8000/rooms/demo/holds \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_hold_version":0,"positions":[1,2]}'
+# → {"changed":true,"hold_version":1,"pending_holds":[{"position":1,...},{"position":2,...}],"state":{...}}
+# quorum 推进到止点 1 即被挡住（参与者最新位置仍保留）；/state 的 last_hold_block 给出最近一次阻挡信息
+
+# 10. 放行止点：原子递增 hold_version 并立即用当前活跃参与者重算，
+#     满足条件可在同一响应中继续推进（仍不得越过其余未放行止点）
+curl -X POST http://localhost:8000/rooms/demo/holds/release \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_hold_version":1,"positions":[1]}'
+# → {"released":[1],"hold_version":2,"advancement":{"position":2,...},"state":{...}}
 ```
 
 ## API 一览
@@ -98,9 +116,12 @@ curl -X PUT http://localhost:8000/rooms/demo/cursor \
 | GET    | `/rooms/{room_id}/lines`        | 查看台词（含当前 `revision`）              |
 | PATCH  | `/rooms/{room_id}/lines`        | 台本增量修订（版本校验 + 整批原子生效）    |
 | POST   | `/rooms/{room_id}/events`       | 演员上报位置（须携带 `progress_epoch`；旧代际/暂停时 409） |
+| PUT    | `/rooms/{room_id}/holds`        | 导演批量设置未放行止点（`hold_version` 乐观锁，整组替换） |
+| GET    | `/rooms/{room_id}/holds`        | 查看未放行止点（含当前 `hold_version`）    |
+| POST   | `/rooms/{room_id}/holds/release` | 放行止点（原子增版本并立即重算，可同响应继续推进） |
 | PUT    | `/rooms/{room_id}/clock`        | 暂停/恢复排练（时钟版本乐观锁）            |
-| PUT    | `/rooms/{room_id}/cursor`       | 导演校准公共位置，可前跳/回退（进度代际乐观锁） |
-| GET    | `/rooms/{room_id}/state`        | 当前活跃成员、公共位置、最近一次推进原因   |
+| PUT    | `/rooms/{room_id}/cursor`       | 导演校准公共位置，可前跳/回退（进度代际乐观锁；越过的止点自动释放） |
+| GET    | `/rooms/{room_id}/state`        | 活跃成员、公共位置、止点状态、最近推进/阻挡信息 |
 | GET    | `/rooms/{room_id}/advancements` | 完整推进历史（含每次推进原因）             |
 | GET    | `/health`                       | 健康检查                                   |
 
@@ -126,8 +147,42 @@ curl -X PUT http://localhost:8000/rooms/demo/cursor \
   - 校验通过后在同一事务中原子完成：公共位置更新为目标位置（可低于当前
     位置）、`progress_epoch` 递增、**清空全部参与者进度**（新代际从干净
     状态重新汇聚），并在推进历史中写入一条“导演校准”记录。
+  - **校准不受止点限制**：被校准动作**严格越过**（位于目标位置之前）的
+    未放行止点自动释放、`hold_version` 递增；恰好落在目标位置上的止点
+    保留，仍可阻挡后续推进。
 - **推进规则**：公共位置 = 活跃参与者中第 `advance_threshold` 高的位置，即
   “达到指定人数的最高台词”。活跃指在 `offline_timeout_seconds` 内有上报。
+  自动推进还受未放行止点约束（见下）。
+- **台词止点（holds）**：导演可在台本行上设置未放行止点，演员侧仍按现有
+  quorum 计算候选位置，但**自动推进不得越过最靠前的未放行止点**。
+  - **批量设置**（`PUT /rooms/{room_id}/holds`，请求体
+    `{"expected_hold_version": <当前版本>, "positions": [<行号>...]}`）：
+    整组替换当前止点（重复行号去重、传空列表即清空）；止点位置必须属于
+    当前台本（越界 → **422**，未导入台词 → **409**）。目标集合与当前一致
+    时为**幂等空操作**，`hold_version` 不递增；否则版本不匹配 → **409**，
+    校验通过后原子替换并递增 `hold_version`。设置止点本身不触发推进重算；
+  - **推进钳制**：quorum 候选位置高于止点时，公共位置停在最靠前的止点
+    （候选恰好等于止点则正常到达，不算阻挡）；**参与者上报的最新位置原样
+    保留**，不放行也能继续刷新，放行后立即按这些位置重算。设置在公共位置
+    之后的止点才会阻挡；已位于公共位置（已到达未放行）的止点阻挡继续前进；
+  - **放行**（`POST /rooms/{room_id}/holds/release`，请求体
+    `{"expected_hold_version": <当前版本>, "positions": [<行号>...]}`）：
+    版本不匹配 → **409**；放行不存在的止点 → **422**。校验通过后在同一事务
+    中删除止点、**原子递增 `hold_version`**，并**立即用当前活跃参与者重算**：
+    quorum 满足时可在**同一响应**中继续推进（仍受其余未放行止点约束，最多
+    停在下一道止点），响应的 `advancement` 给出本次推进（无推进为 `null`）；
+  - **修订与导入**：增量修订后止点按**原台词身份**重排（保留/被替换的台词
+    跟随新位置），**被删台词上的止点移除**（不回退）；止点集合实际变化时
+    `hold_version` 递增，PATCH 响应附带 `holds_removed` 与 `pending_holds`。
+    **整体导入清空全部止点与阻挡信息**；
+  - **手动校准**：导演校准不受止点限制（见上一条），被严格越过的止点自动
+    释放；暂停期间也可以设置/放行止点（活跃集合冻结，通常不会立即推进）；
+  - **状态字段**：`/state` 与 `GET /holds` 返回 `hold_version`（设置/放行/
+    随修订变化/导入清空/校准自动释放后递增，初值 0）、`pending_holds`
+    （`[{position, text}]` 升序）以及 `last_hold_block`（最近一次阻挡信息：
+    `hold_position`、`candidate_position`、`contributors`、`reason`、`at`；
+    无阻挡为 `null`）。`hold_version` 与 `revision`、`progress_epoch`、
+    `clock_version` 相互独立。
 - **绝不回退**：公共位置只升不降。参与者超时离线、演员自己回报更低位置，
   都不会使公共位置下降。
 - **离线超时**：超过超时未上报的参与者退出活跃成员列表与推进人数计算；
@@ -159,7 +214,8 @@ curl -X PUT http://localhost:8000/rooms/demo/cursor \
   进度代际，导演校准不改变台本版本。
 - **台词导入**：整体替换台本并重置房间进度（公共位置、参与者、推进历史），
   同时开启新版本（`revision` 递增）与新进度代际（`progress_epoch` 递增），
-  使重导前在途的旧代际上报全部失效。
+  使重导前在途的旧代际上报全部失效；**全部止点与最近阻挡信息一并清空**
+  （此前存在止点状态时 `hold_version` 同步递增）。
 - **台本增量修订**：`PATCH /rooms/{room_id}/lines` 携带 `base_revision` 与一组
   按**当前行号**执行的 `insert` / `replace` / `delete` 操作，整批在事务中校验、
   原子生效：
@@ -168,7 +224,9 @@ curl -X PUT http://localhost:8000/rooms/demo/cursor \
     操作冲突（重复删除、重复替换、替换又删除）→ **422**，**全部不落库**；
   - 修订成功后 `revision` 递增，参与者与公共位置按原先指向的**台词身份**
     重排：保留（含被替换）的台词跟随新位置，被删除的回退到最近仍保留的
-    前一行，无前一行则置为 `-1`；修订本身**不产生推进记录**。
+    前一行，无前一行则置为 `-1`；修订本身**不产生推进记录**；
+  - **止点同批按台词身份重排**：保留台词上的止点跟随新位置，被删台词上的
+    止点直接移除（集合实际变化时 `hold_version` 递增）。
 - 时间字段均为 epoch 秒（浮点）；`state.server_time` 可用于对齐超时判断。
 
 ## 本地开发（不用 Docker）
